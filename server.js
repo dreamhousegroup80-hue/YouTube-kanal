@@ -1,79 +1,76 @@
+// ─────────────────────────────────────────────────────────────────────────────
+// railway-github-ffmpeg
+//
+// HTTP ffmpeg render service for the n8n "Scheduled and Manual Start" pipeline.
+//
+// NO Google authentication needed here. n8n lists the Drive folder itself and
+// passes PUBLIC download links; this service just downloads each URL, runs the
+// generated .sh, and streams the finished final.mp4 straight back in the HTTP
+// response. n8n then uploads that mp4 to Drive.
+//
+// Contract with n8n (node "Call Railway FFmpeg"):
+//   POST /render
+//   body: {
+//     topic_title?: string,                       // for logging only
+//     files: [ { name: "S0001.jpg", url: "https://drive.google.com/uc?..." }, ... ]
+//   }
+//   -> response: the finished final.mp4 (Content-Type: video/mp4) as a binary body.
+//
+// What it does per request:
+//   1. Downloads every file in `files[]` into a temp working dir under its `name`
+//      (skips any previous final_video*.mp4).
+//   2. Finds the newest Documentary_FFmpeg_*.sh (any *.sh) among them.
+//   3. Runs it with bash (ffmpeg must be on PATH -> installed via Dockerfile).
+//   4. Streams the resulting final.mp4 back to the caller.
+//
+// Auth (inbound, optional): set RENDER_TOKEN and send it from n8n as
+//   Authorization: Bearer <RENDER_TOKEN>
+// ─────────────────────────────────────────────────────────────────────────────
+
 import express from 'express';
-import { google } from 'googleapis';
 import { spawn } from 'node:child_process';
 import { promises as fs, createReadStream, createWriteStream } from 'node:fs';
+import { pipeline } from 'node:stream/promises';
+import { Readable } from 'node:stream';
 import os from 'node:os';
 import path from 'node:path';
-import crypto from 'node:crypto';
 
 const PORT = process.env.PORT || 8080;
 const RENDER_TOKEN = process.env.RENDER_TOKEN || '';
-const PUBLIC_BASE_URL = (process.env.PUBLIC_BASE_URL || '').replace(/\/+$/, '');
 
-function driveClient() {
-  const raw = process.env.GOOGLE_SERVICE_ACCOUNT_JSON;
-  if (!raw) throw new Error('GOOGLE_SERVICE_ACCOUNT_JSON env var is not set');
-  let creds;
-  try { creds = JSON.parse(raw); }
-  catch (e) { throw new Error('GOOGLE_SERVICE_ACCOUNT_JSON is not valid JSON: ' + e.message); }
-  const auth = new google.auth.JWT({
-    email: creds.client_email,
-    key: creds.private_key,
-    scopes: ['https://www.googleapis.com/auth/drive'],
-  });
-  return google.drive({ version: 'v3', auth });
+// ── download a single public URL to a local path ─────────────────────────────
+async function downloadUrl(url, destPath) {
+  const resp = await fetch(url, { redirect: 'follow' });
+  if (!resp.ok || !resp.body) {
+    throw new Error(`download failed (${resp.status}) for ${url}`);
+  }
+  // Guard against Google Drive's HTML "virus scan" interstitial for big files.
+  const ctype = resp.headers.get('content-type') || '';
+  if (ctype.includes('text/html')) {
+    const html = await resp.text();
+    const m = html.match(/href="(\/uc\?export=download[^"]+)"/);
+    if (m) {
+      const retryUrl = 'https://drive.google.com' + m[1].replace(/&amp;/g, '&');
+      const r2 = await fetch(retryUrl, { redirect: 'follow' });
+      if (!r2.ok || !r2.body) throw new Error(`download retry failed (${r2.status}) for ${url}`);
+      await pipeline(Readable.fromWeb(r2.body), createWriteStream(destPath));
+      return;
+    }
+    throw new Error(`got HTML instead of file for ${url} (is it shared "anyone with link"?)`);
+  }
+  await pipeline(Readable.fromWeb(resp.body), createWriteStream(destPath));
 }
 
-async function listFolder(drive, folderId) {
-  const files = [];
-  let pageToken;
-  do {
-    const res = await drive.files.list({
-      q: `'${folderId}' in parents and trashed = false`,
-      fields: 'nextPageToken, files(id, name, mimeType, size)',
-      pageSize: 1000, pageToken,
-      supportsAllDrives: true, includeItemsFromAllDrives: true,
-    });
-    files.push(...(res.data.files || []));
-    pageToken = res.data.nextPageToken;
-  } while (pageToken);
-  return files;
-}
-
-async function downloadFile(drive, fileId, destPath) {
-  const res = await drive.files.get(
-    { fileId, alt: 'media', supportsAllDrives: true },
-    { responseType: 'stream' }
-  );
-  await new Promise((resolve, reject) => {
-    const out = createWriteStream(destPath);
-    res.data.on('error', reject).pipe(out).on('error', reject).on('finish', resolve);
-  });
-}
-
-async function uploadFile(drive, folderId, localPath, name, mimeType) {
-  const res = await drive.files.create({
-    requestBody: { name, parents: [folderId] },
-    media: { mimeType, body: createReadStream(localPath) },
-    fields: 'id, name, webViewLink, webContentLink',
-    supportsAllDrives: true,
-  });
-  try {
-    await drive.permissions.create({
-      fileId: res.data.id,
-      requestBody: { role: 'reader', type: 'anyone' },
-      supportsAllDrives: true,
-    });
-  } catch (e) { console.warn('Could not set public permission:', e.message); }
-  return res.data;
-}
-
+// ── run the generated bash/ffmpeg script ─────────────────────────────────────
 function runScript(scriptPath, cwd) {
   return new Promise((resolve, reject) => {
     const child = spawn('bash', [scriptPath], { cwd, env: process.env });
     let stderr = '';
     child.stdout.on('data', (d) => process.stdout.write(d));
-    child.stderr.on('data', (d) => { stderr += d.toString(); process.stderr.write(d); });
+    child.stderr.on('data', (d) => {
+      stderr += d.toString();
+      process.stderr.write(d);
+    });
     child.on('error', reject);
     child.on('close', (code) => {
       if (code === 0) resolve();
@@ -82,15 +79,16 @@ function runScript(scriptPath, cwd) {
   });
 }
 
+// ── HTTP server ──────────────────────────────────────────────────────────────
 const app = express();
 app.use(express.json({ limit: '5mb' }));
-const rendered = new Map();
 
 function checkAuth(req, res) {
-  if (!RENDER_TOKEN) return true;
-  const ok = (req.get('authorization') || '') === `Bearer ${RENDER_TOKEN}`;
-  if (!ok) { res.status(401).json({ error: 'unauthorized' }); return false; }
-  return true;
+  if (!RENDER_TOKEN) return true; // auth disabled
+  const hdr = req.get('authorization') || '';
+  if (hdr === `Bearer ${RENDER_TOKEN}`) return true;
+  res.status(401).json({ error: 'unauthorized' });
+  return false;
 }
 
 app.get('/', (_req, res) => res.json({ ok: true, service: 'railway-github-ffmpeg' }));
@@ -98,68 +96,52 @@ app.get('/health', (_req, res) => res.json({ ok: true }));
 
 app.post('/render', async (req, res) => {
   if (!checkAuth(req, res)) return;
-  const { topic_title, drive_folder_id } = req.body || {};
-  if (!drive_folder_id) return res.status(400).json({ error: 'drive_folder_id is required' });
+
+  const { topic_title, files } = req.body || {};
+  if (!Array.isArray(files) || files.length === 0) {
+    return res.status(400).json({ error: 'files[] is required (array of { name, url })' });
+  }
 
   const work = await fs.mkdtemp(path.join(os.tmpdir(), 'render-'));
-  console.log(`[render] topic="${topic_title || ''}" folder=${drive_folder_id} work=${work}`);
-  try {
-    const drive = driveClient();
-    const files = await listFolder(drive, drive_folder_id);
-    if (files.length === 0)
-      return res.status(422).json({ error: 'drive folder is empty or not shared with the service account' });
+  console.log(`[render] topic="${topic_title || ''}" files=${files.length} work=${work}`);
 
-    const shFiles = [];
+  try {
     for (const f of files) {
-      if (f.mimeType === 'application/vnd.google-apps.folder') continue;
-      if (/^final_video.*\.mp4$/i.test(f.name)) continue;
-      const dest = path.join(work, f.name);
-      await downloadFile(drive, f.id, dest);
-      if (/\.sh$/i.test(f.name) || /ffmpeg/i.test(f.name)) shFiles.push(f.name);
+      if (!f || !f.name || !f.url) continue;
+      if (/^final_video.*\.mp4$/i.test(f.name)) continue; // skip prior outputs
+      await downloadUrl(f.url, path.join(work, f.name));
       console.log(`[render] downloaded ${f.name}`);
     }
 
-    shFiles.sort();
+    // Pick the newest generated ffmpeg .sh (workflow names them Documentary_FFmpeg_*.sh)
+    const local = await fs.readdir(work);
+    const shFiles = local.filter((n) => /\.sh$/i.test(n) || /ffmpeg/i.test(n)).sort();
     const scriptName = shFiles[shFiles.length - 1];
-    if (!scriptName) return res.status(422).json({ error: 'no Documentary_FFmpeg_*.sh found in the folder' });
+    if (!scriptName) {
+      return res.status(422).json({ error: 'no Documentary_FFmpeg_*.sh found in files[]' });
+    }
     console.log(`[render] running ${scriptName}`);
     await runScript(path.join(work, scriptName), work);
 
     const finalPath = path.join(work, 'final.mp4');
-    try { await fs.access(finalPath); }
-    catch { return res.status(500).json({ error: 'render finished but final.mp4 was not produced' }); }
-
-    const outName = `final_video_${new Date().toISOString().replace(/[-:T]/g, '').slice(0, 12)}.mp4`;
-
-    if (PUBLIC_BASE_URL) {
-      const token = crypto.randomBytes(16).toString('hex');
-      const keep = path.join(os.tmpdir(), `out-${token}.mp4`);
-      await fs.copyFile(finalPath, keep);
-      rendered.set(token, { path: keep, name: outName });
-      const video_url = `${PUBLIC_BASE_URL}/file/${token}`;
-      let drive_file_id = null;
-      try { drive_file_id = (await uploadFile(drive, drive_folder_id, finalPath, outName, 'video/mp4')).id; }
-      catch (e) { console.warn('Drive archive upload failed:', e.message); }
-      return res.json({ video_url, file_name: outName, drive_file_id });
+    try {
+      await fs.access(finalPath);
+    } catch {
+      return res.status(500).json({ error: 'render finished but final.mp4 was not produced' });
     }
 
-    const up = await uploadFile(drive, drive_folder_id, finalPath, outName, 'video/mp4');
-    const publicUrl = up.webContentLink || `https://drive.google.com/uc?export=download&id=${up.id}`;
-    return res.json({ video_url: publicUrl, file_name: outName, drive_file_id: up.id });
+    const outName = `final_video_${new Date().toISOString().replace(/[-:T]/g, '').slice(0, 12)}.mp4`;
+    res.setHeader('Content-Type', 'video/mp4');
+    res.setHeader('Content-Disposition', `attachment; filename="${outName}"`);
+    console.log(`[render] done -> streaming ${outName}`);
+    await pipeline(createReadStream(finalPath), res);
   } catch (err) {
     console.error('[render] error:', err);
-    return res.status(500).json({ error: err.message });
+    if (!res.headersSent) res.status(500).json({ error: err.message });
+    else res.end();
   } finally {
     fs.rm(work, { recursive: true, force: true }).catch(() => {});
   }
-});
-
-app.get('/file/:token', (req, res) => {
-  const entry = rendered.get(req.params.token);
-  if (!entry) return res.status(404).json({ error: 'not found or expired' });
-  res.setHeader('Content-Type', 'video/mp4');
-  res.setHeader('Content-Disposition', `attachment; filename="${entry.name}"`);
-  createReadStream(entry.path).on('error', () => res.status(500).end()).pipe(res);
 });
 
 app.listen(PORT, () => console.log(`railway-github-ffmpeg listening on :${PORT}`));
