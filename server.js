@@ -16,13 +16,6 @@
 //   }
 //   -> response: the finished final.mp4 (Content-Type: video/mp4) as a binary body.
 //
-// What it does per request:
-//   1. Downloads every file in `files[]` into a temp working dir under its `name`
-//      (skips any previous final_video*.mp4).
-//   2. Finds the newest Documentary_FFmpeg_*.sh (any *.sh) among them.
-//   3. Runs it with bash (ffmpeg must be on PATH -> installed via Dockerfile).
-//   4. Streams the resulting final.mp4 back to the caller.
-//
 // Auth (inbound, optional): set RENDER_TOKEN and send it from n8n as
 //   Authorization: Bearer <RENDER_TOKEN>
 // ─────────────────────────────────────────────────────────────────────────────
@@ -48,6 +41,21 @@ async function downloadUrl(url, destPath) {
   const ctype = resp.headers.get('content-type') || '';
   if (ctype.includes('text/html')) {
     const html = await resp.text();
+    // Newer interstitial: a <form action="...drive.usercontent.google.com/download"> with hidden inputs.
+    const formAction = html.match(/action="(https:\/\/drive\.usercontent\.google\.com\/download[^"]*)"/);
+    if (formAction) {
+      const params = {};
+      const re = /name="([^"]+)"\s+value="([^"]*)"/g;
+      let mm;
+      while ((mm = re.exec(html)) !== null) params[mm[1]] = mm[2];
+      const usp = new URLSearchParams(params);
+      const retryUrl = formAction[1].replace(/&amp;/g, '&') + (formAction[1].includes('?') ? '&' : '?') + usp.toString();
+      const r2 = await fetch(retryUrl, { redirect: 'follow' });
+      if (!r2.ok || !r2.body) throw new Error(`download retry failed (${r2.status}) for ${url}`);
+      await pipeline(Readable.fromWeb(r2.body), createWriteStream(destPath));
+      return;
+    }
+    // Older interstitial: an <a href="/uc?export=download&confirm=..."> link.
     const m = html.match(/href="(\/uc\?export=download[^"]+)"/);
     if (m) {
       const retryUrl = 'https://drive.google.com' + m[1].replace(/&amp;/g, '&');
@@ -77,6 +85,81 @@ function runScript(scriptPath, cwd) {
       else reject(new Error('render script exited with code ' + code + '\n' + stderr.slice(-4000)));
     });
   });
+}
+
+// ── run any command, resolve with { code, stdout, stderr } ────────────────────
+function run(cmd, args, cwd) {
+  return new Promise((resolve, reject) => {
+    const child = spawn(cmd, args, { cwd, env: process.env });
+    let stdout = '';
+    let stderr = '';
+    child.stdout.on('data', (d) => { stdout += d.toString(); });
+    child.stderr.on('data', (d) => { stderr += d.toString(); });
+    child.on('error', reject);
+    child.on('close', (code) => resolve({ code, stdout, stderr }));
+  });
+}
+
+// ── measure media duration in seconds via ffprobe ─────────────────────────────
+async function probeDuration(filePath, cwd) {
+  const r = await run('ffprobe', ['-v', 'error', '-show_entries', 'format=duration', '-of', 'default=noprint_wrappers=1:nokey=1', filePath], cwd);
+  const val = parseFloat((r.stdout || '').trim());
+  return Number.isFinite(val) ? val : 0;
+}
+
+// ── A/V sync fix ──────────────────────────────────────────────────────────────
+// The .sh times each shot from an ESTIMATED duration (~2.5 words/sec), but real
+// ElevenLabs narration runs at its own pace, so image cuts drift ahead of the
+// voice. Here we stretch the whole silent video uniformly so its length matches
+// the real voiceover, then remux audio. This re-seats every cut on its narration.
+async function fixSync(cwd) {
+  const silent = path.join(cwd, 'video_no_audio.mp4');
+  const voice = path.join(cwd, 'voiceover.mp3');
+  const music = path.join(cwd, 'music.mp3');
+  try {
+    await fs.access(silent);
+    await fs.access(voice);
+  } catch {
+    console.log('[sync] intermediates missing (video_no_audio.mp4 / voiceover.mp3) — keeping .sh final.mp4');
+    return; // fall back to whatever the .sh produced
+  }
+
+  const vDur = await probeDuration(silent, cwd);
+  const aDur = await probeDuration(voice, cwd);
+  if (vDur <= 0 || aDur <= 0) {
+    console.log(`[sync] bad durations v=${vDur} a=${aDur} — keeping .sh final.mp4`);
+    return;
+  }
+
+  // setpts factor: >1 slows video down (lengthens), <1 speeds up (shortens).
+  const factor = aDur / vDur;
+  console.log(`[sync] video=${vDur.toFixed(2)}s voice=${aDur.toFixed(2)}s -> setpts factor ${factor.toFixed(4)}`);
+
+  const stretched = path.join(cwd, 'video_synced.mp4');
+  const r1 = await run('ffmpeg', ['-y', '-i', silent, '-filter:v', `setpts=${factor}*PTS`, '-r', '30', '-c:v', 'libx264', '-pix_fmt', 'yuv420p', '-an', stretched], cwd);
+  if (r1.code !== 0) {
+    console.error('[sync] stretch failed — keeping .sh final.mp4\n' + r1.stderr.slice(-2000));
+    return;
+  }
+
+  const outFinal = path.join(cwd, 'final.mp4');
+  let hasMusic = false;
+  try { await fs.access(music); hasMusic = true; } catch { hasMusic = false; }
+
+  let r2;
+  if (hasMusic) {
+    r2 = await run('ffmpeg', ['-y', '-i', stretched, '-i', voice, '-i', music,
+      '-filter_complex', '[2:a]volume=0.15[m];[1:a][m]amix=inputs=2:duration=first[a]',
+      '-map', '0:v', '-map', '[a]', '-c:v', 'copy', '-c:a', 'aac', '-shortest', outFinal], cwd);
+  } else {
+    r2 = await run('ffmpeg', ['-y', '-i', stretched, '-i', voice,
+      '-map', '0:v', '-map', '1:a', '-c:v', 'copy', '-c:a', 'aac', '-shortest', outFinal], cwd);
+  }
+  if (r2.code !== 0) {
+    console.error('[sync] remux failed — keeping .sh final.mp4\n' + r2.stderr.slice(-2000));
+    return;
+  }
+  console.log('[sync] final.mp4 rebuilt in sync with voiceover');
 }
 
 // ── HTTP server ──────────────────────────────────────────────────────────────
@@ -122,6 +205,10 @@ app.post('/render', async (req, res) => {
     }
     console.log(`[render] running ${scriptName}`);
     await runScript(path.join(work, scriptName), work);
+
+    // Re-seat image cuts on the real narration (fix A/V drift). Best-effort:
+    // on any problem it keeps the .sh-produced final.mp4.
+    try { await fixSync(work); } catch (e) { console.error('[sync] skipped:', e.message); }
 
     const finalPath = path.join(work, 'final.mp4');
     try {
