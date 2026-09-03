@@ -1,9 +1,9 @@
 {
   "name": "railway-github-ffmpeg",
   "version": "1.0.0",
-  "description": "HTTP ffmpeg render service for the n8n documentary pipeline. Downloads assets + generated .sh from public URLs passed by n8n, renders final.mp4, streams it back over HTTP.",
-  "main": "server.js",
   "type": "module",
+  "private": true,
+  "main": "server.js",
   "scripts": {
     "start": "node server.js"
   },
