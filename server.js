@@ -2,185 +2,165 @@ const express = require('express');
 const multer = require('multer');
 const { spawn } = require('child_process');
 const fs = require('fs');
-const os = require('os');
 const path = require('path');
+const os = require('os');
 
-const VERSION = 'tiles-v2';
-const W = 900;
-const H = 1600;
-const FPS = 30;
+const VERSION = 'tiles-v3';
+const W = 720, H = 1280, FPS = 30;
+const S = H / 1600; // масштаб от старого холста 900x1600
 
 const app = express();
-const upload = multer({ dest: os.tmpdir(), limits: { fileSize: 500 * 1024 * 1024 } });
+
+const upload = multer({
+  storage: multer.diskStorage({
+    destination: (req, file, cb) => {
+      if (!req.jobDir) req.jobDir = fs.mkdtempSync(path.join(os.tmpdir(), 'job-'));
+      cb(null, req.jobDir);
+    },
+    filename: (req, file, cb) =>
+      cb(null, file.fieldname + (path.extname(file.originalname || '') || '.bin')),
+  }),
+  limits: { fileSize: 500 * 1024 * 1024 },
+});
 
 function run(cmd, args) {
   return new Promise((resolve, reject) => {
     const p = spawn(cmd, args);
-    let out = '';
-    let err = '';
-    p.stdout.on('data', (d) => { out += d; });
-    p.stderr.on('data', (d) => { err += d; if (err.length > 20000) err = err.slice(-20000); });
+    let out = '', err = '';
+    p.stdout.on('data', d => { out += d; });
+    p.stderr.on('data', d => { err += d; if (err.length > 8000) err = err.slice(-8000); });
     p.on('error', reject);
-    p.on('close', (code, signal) => {
-      if (code === 0) return resolve(out);
-      reject(new Error(cmd + ' exited code=' + code + ' signal=' + signal + ': ' + err.slice(-2000)));
-    });
+    p.on('close', (code, signal) => code === 0
+      ? resolve(out)
+      : reject(new Error(`${cmd} exited code=${code} signal=${signal}: ${err.slice(-1500)}`)));
   });
 }
+const ff = args => run('ffmpeg', ['-hide_banner', '-loglevel', 'error', '-y', ...args]);
+const even = n => Math.max(2, Math.round(n / 2) * 2);
 
-async function probe(file) {
-  const out = await run('ffprobe', ['-v', 'error', '-show_entries', 'format=duration:stream=codec_type', '-of', 'json', file]);
-  const j = JSON.parse(out);
-  return {
-    duration: parseFloat(j.format && j.format.duration) || 0,
-    hasAudio: (j.streams || []).some((s) => s.codec_type === 'audio'),
-  };
+async function probeDuration(file) {
+  const out = await run('ffprobe', ['-v', 'error', '-show_entries', 'format=duration',
+    '-of', 'default=nw=1:nk=1', file]);
+  const d = parseFloat(out);
+  if (!d || !isFinite(d)) throw new Error('cannot read vid duration');
+  return Math.min(d, 600);
 }
 
-function isVideo(file) {
-  if (file.mimetype && file.mimetype.startsWith('video/')) return true;
-  return /\.(mp4|mov|webm|mkv|avi|m4v)$/i.test(file.originalname || '');
+// Склеить PNG-слои в одну прозрачную картинку W x H
+async function composite(layers, out) {
+  const args = ['-f', 'lavfi', '-i', `color=c=black@0.0:s=${W}x${H},format=rgba`];
+  layers.forEach(f => args.push('-i', f));
+  let fc = '[0:v]format=rgba[c0]';
+  layers.forEach((f, i) => {
+    fc += `;[${i + 1}:v]scale=${W}:${H},format=rgba[l${i}]` +
+          `;[c${i}][l${i}]overlay=0:0:format=rgb[c${i + 1}]`;
+  });
+  fc += `;[c${layers.length}]format=rgba[out]`;
+  args.push('-filter_complex', fc, '-map', '[out]', '-frames:v', '1', '-update', '1', out);
+  await ff(args);
 }
 
-// Resize a still image to W x H RGBA PNG once
-async function prescale(file, tmpList) {
-  const out = file.path + '_scaled.png';
-  tmpList.push(out);
-  await run('ffmpeg', ['-y', '-loglevel', 'error', '-i', file.path,
-    '-vf', 'scale=' + W + ':' + H + ',format=rgba', '-frames:v', '1', out]);
-  return out;
-}
+// Один рендер за раз, чтобы не удваивать память
+let queue = Promise.resolve();
+const serial = fn => { const r = queue.then(fn, fn); queue = r.catch(() => {}); return r; };
 
-app.get('/health', (req, res) => res.json({ ok: true, version: VERSION }));
+app.get('/health', (req, res) => res.json({ ok: true, version: VERSION, size: `${W}x${H}` }));
 
 app.post('/render', upload.any(), async (req, res) => {
-  const files = req.files || [];
-  const f = {};
-  for (const file of files) f[file.fieldname] = file;
-  if (!f['niz-pravo'] && f.nizpravo) f['niz-pravo'] = f.nizpravo;
-
-  const tmp = [];
-  const outFile = path.join(os.tmpdir(), 'tiles_' + Date.now() + '_' + Math.random().toString(36).slice(2) + '.mp4');
-  const cleanup = () => {
-    for (const file of files) fs.unlink(file.path, () => {});
-    for (const t of tmp) fs.unlink(t, () => {});
-    fs.unlink(outFile, () => {});
-  };
-
+  const dir = req.jobDir || fs.mkdtempSync(path.join(os.tmpdir(), 'job-'));
+  const cleanup = () => fs.rm(dir, { recursive: true, force: true }, () => {});
   try {
-    if (!f.fon || !f.vid) {
-      cleanup();
-      return res.status(400).json({ error: 'fon and vid are required', received: Object.keys(f) });
-    }
+    const f = {};
+    (req.files || []).forEach(file => { f[file.fieldname] = file; });
+    if (!f.vid) throw new Error('missing field: vid');
+    if (!f.fon) throw new Error('missing field: fon');
 
     let payload = {};
-    try { payload = JSON.parse(req.body.payload || '{}'); } catch (e) { payload = {}; }
-    const layers = Array.isArray(payload.layers) ? payload.layers : [];
-    const vidLayer = layers.find((l) => l.name === 'vid') || {};
-    const ramkaLayer = layers.find((l) => l.name === 'ramka') || {};
-    const vidH = Number(vidLayer.scale_to) || 750;
-    const vidY = Number(vidLayer.y) || 0;
-    const ramkaSec = Number(ramkaLayer.seconds_each) || 3;
+    try { payload = typeof req.body.payload === 'string' ? JSON.parse(req.body.payload) : (req.body.payload || {}); } catch (e) {}
 
-    const info = await probe(f.vid.path);
-    if (!info.duration) throw new Error('Cannot read vid duration');
-    const D = info.duration.toFixed(3);
+    const out = await serial(async () => {
+      const p = n => path.join(dir, n);
+      const D = (await probeDuration(f.vid.path)).toFixed(3);
+      const vidH = even((Number(payload.scale_to) || 750) * S);
+      const y = Math.round((Number(payload.y) || 0) * S);
 
-    // Pre-scale still layers once
-    const stillPath = {};
-    for (const key of ['transport', 'niz-pravo', 'ramka1', 'ramka2', 'ramka3', 'item', 'topleft']) {
-      if (f[key] && !isVideo(f[key])) stillPath[key] = await prescale(f[key], tmp);
-    }
+      // 1. Неподвижные слои
+      const under = p('under.png');
+      await composite(['transport', 'niz-pravo'].filter(k => f[k]).map(k => f[k].path), under);
 
-    // ---------- inputs ----------
-    const args = ['-y', '-loglevel', 'error', '-nostats', '-filter_complex_threads', '1'];
-    const idx = {};
-    let n = 0;
-    const addInput = (key, loop) => {
-      if (stillPath[key]) {
-        args.push('-loop', '1', '-framerate', String(FPS), '-t', D, '-i', stillPath[key]);
-      } else if (isVideo(f[key])) {
-        if (loop) args.push('-stream_loop', '-1');
-        args.push('-i', f[key].path);
-      } else {
-        args.push('-loop', '1', '-framerate', String(FPS), '-t', D, '-i', f[key].path);
+      const topsFixed = ['item', 'topleft'].filter(k => f[k]).map(k => f[k].path);
+      const ramkas = ['ramka1', 'ramka2', 'ramka3'].filter(k => f[k]).map(k => f[k].path);
+      const tops = [];
+      if (ramkas.length) {
+        for (let i = 0; i < ramkas.length; i++) {
+          const t = p(`top${i + 1}.png`);
+          await composite([ramkas[i], ...topsFixed], t);
+          tops.push(t);
+        }
+      } else if (topsFixed.length) {
+        const t = p('top1.png');
+        await composite(topsFixed, t);
+        tops.push(t);
       }
-      idx[key] = n++;
-    };
 
-    addInput('fon', true);
-    for (const key of ['transport', 'niz-pravo']) if (f[key]) addInput(key, true);
-    addInput('vid', false);
-    const ramkaKeys = ['ramka1', 'ramka2', 'ramka3'].filter((k) => f[k]);
-    for (const key of ramkaKeys) addInput(key, true);
-    for (const key of ['item', 'topleft']) if (f[key]) addInput(key, true);
+      // 2. Фон: зациклить, без звука, W x H
+      const fonS = p('fon_s.mp4');
+      const fonIsImage = /^image\//.test(f.fon.mimetype || '');
+      await ff([
+        ...(fonIsImage ? ['-loop', '1', '-framerate', String(FPS)] : ['-stream_loop', '-1']),
+        '-threads', '1', '-t', D, '-i', f.fon.path,
+        '-vf', `scale=${W}:${H}:force_original_aspect_ratio=increase,crop=${W}:${H},fps=${FPS}`,
+        '-an', '-t', D, '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '22',
+        '-pix_fmt', 'yuv420p', '-threads', '1', fonS,
+      ]);
 
-    // ---------- filters ----------
-    const filters = [];
-    filters.push('[' + idx.fon + ':v]scale=' + W + ':' + H + ':force_original_aspect_ratio=increase,crop=' + W + ':' + H + ',setsar=1,fps=' + FPS + '[base0]');
-    let cur = 'base0';
-    let k = 0;
-    const overlay = (src, x, y, enable) => {
-      const out = 'base' + (++k);
-      let s = '[' + cur + '][' + src + ']overlay=x=' + x + ':y=' + y;
-      if (enable) s += ":enable='" + enable + "'";
-      filters.push(s + '[' + out + ']');
-      cur = out;
-    };
-    const layer = (key, enable) => {
-      if (stillPath[key]) {
-        overlay(idx[key] + ':v', 0, 0, enable);
-      } else {
-        const label = 'L' + key.replace(/\W/g, '');
-        filters.push('[' + idx[key] + ':v]scale=' + W + ':' + H + ',setsar=1,fps=' + FPS + '[' + label + ']');
-        overlay(label, 0, 0, enable);
-      }
-    };
+      // 3. Vid: уменьшить, звук оставить
+      const vidS = p('vid_s.mp4');
+      await ff([
+        '-threads', '1', '-i', f.vid.path,
+        '-vf', `scale=-2:${vidH},fps=${FPS}`,
+        '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '20', '-pix_fmt', 'yuv420p',
+        '-c:a', 'aac', '-b:a', '128k', '-threads', '1', vidS,
+      ]);
 
-    if (f.transport) layer('transport');
-    if (f['niz-pravo']) layer('niz-pravo');
+      // 4. Финальная сборка
+      const result = p('out.mp4');
+      const args = [
+        '-threads', '1', '-i', fonS,
+        '-loop', '1', '-framerate', String(FPS), '-t', D, '-i', under,
+        '-threads', '1', '-i', vidS,
+      ];
+      tops.forEach(t => args.push('-loop', '1', '-framerate', String(FPS), '-t', D, '-i', t));
 
-    filters.push('[' + idx.vid + ':v]scale=-2:' + vidH + ',setsar=1,fps=' + FPS + '[Lvid]');
-    overlay('Lvid', '(main_w-overlay_w)/2', vidY);
-
-    if (ramkaKeys.length) {
-      const cycle = ramkaKeys.length * ramkaSec;
-      ramkaKeys.forEach((key, i) => {
-        const a = i * ramkaSec;
-        const b = (i + 1) * ramkaSec;
-        layer(key, 'gte(mod(t,' + cycle + '),' + a + ')*lt(mod(t,' + cycle + '),' + b + ')');
+      let fc = `[0:v][1:v]overlay=0:0[b1];[b1][2:v]overlay=(W-w)/2:${y}:eof_action=pass[b2]`;
+      let last = 'b2';
+      const n = tops.length, cycle = n * 3;
+      tops.forEach((t, i) => {
+        const en = n > 1 ? `:enable='gte(mod(t,${cycle}),${i * 3})*lt(mod(t,${cycle}),${(i + 1) * 3})'` : '';
+        fc += `;[${last}][${3 + i}:v]overlay=0:0${en}[t${i}]`;
+        last = `t${i}`;
       });
-    }
+      fc += `;[${last}]format=yuv420p[v]`;
 
-    if (f.item) layer('item');
-    if (f.topleft) layer('topleft');
+      args.push(
+        '-filter_complex', fc, '-filter_complex_threads', '1',
+        '-map', '[v]', '-map', '2:a?', '-t', D,
+        '-c:v', 'libx264', '-preset', 'superfast', '-crf', '23', '-threads', '2',
+        '-c:a', 'copy', '-movflags', '+faststart', result,
+      );
+      await ff(args);
+      return result;
+    });
 
-    filters.push('[' + cur + ']format=yuv420p[vout]');
-
-    args.push('-filter_complex', filters.join(';'), '-map', '[vout]');
-    if (info.hasAudio) args.push('-map', idx.vid + ':a', '-c:a', 'aac', '-b:a', '160k');
-    else args.push('-an');
-    args.push(
-      '-t', D, '-r', String(FPS),
-      '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '23',
-      '-threads', '2', '-x264-params', 'rc-lookahead=10',
-      '-pix_fmt', 'yuv420p', '-movflags', '+faststart',
-      outFile
-    );
-
-    console.log('Rendering', payload.title || '', 'duration', D, 'inputs', Object.keys(idx));
-    await run('ffmpeg', args);
-
-    const name = (payload.title || 'tiles_hop').replace(/[^\w#-]+/g, '_') + '.mp4';
     res.setHeader('Content-Type', 'video/mp4');
-    res.setHeader('Content-Disposition', 'attachment; filename="' + name + '"');
-    res.sendFile(outFile, () => cleanup());
+    res.setHeader('Content-Disposition', 'attachment; filename="tiles_hop.mp4"');
+    res.sendFile(out, err => { cleanup(); if (err && !res.headersSent) res.status(500).end(); });
   } catch (e) {
-    console.error(e.message);
     cleanup();
-    if (!res.headersSent) res.status(500).json({ error: e.message });
+    console.error(e);
+    res.status(500).json({ error: e.message });
   }
 });
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log('Server ' + VERSION + ' on ' + PORT));
+app.listen(PORT, () => console.log(`render server ${VERSION} on ${PORT}`));
