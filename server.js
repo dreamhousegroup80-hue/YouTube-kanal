@@ -5,9 +5,9 @@ const fs = require('fs');
 const path = require('path');
 const os = require('os');
 
-const VERSION = 'tiles-v3';
+const VERSION = 'tiles-v4';
 const W = 720, H = 1280, FPS = 30;
-const S = H / 1600; // масштаб от старого холста 900x1600
+const S = H / 1600;
 
 const app = express();
 
@@ -31,7 +31,7 @@ function run(cmd, args) {
     p.stderr.on('data', d => { err += d; if (err.length > 8000) err = err.slice(-8000); });
     p.on('error', reject);
     p.on('close', (code, signal) => code === 0
-      ? resolve(out)
+      ? resolve({ out, err })
       : reject(new Error(`${cmd} exited code=${code} signal=${signal}: ${err.slice(-1500)}`)));
   });
 }
@@ -39,14 +39,31 @@ const ff = args => run('ffmpeg', ['-hide_banner', '-loglevel', 'error', '-y', ..
 const even = n => Math.max(2, Math.round(n / 2) * 2);
 
 async function probeDuration(file) {
-  const out = await run('ffprobe', ['-v', 'error', '-show_entries', 'format=duration',
+  const { out } = await run('ffprobe', ['-v', 'error', '-show_entries', 'format=duration',
     '-of', 'default=nw=1:nk=1', file]);
   const d = parseFloat(out);
   if (!d || !isFinite(d)) throw new Error('cannot read vid duration');
   return Math.min(d, 600);
 }
 
-// Склеить PNG-слои в одну прозрачную картинку W x H
+// Найти область рамки (непрозрачные пиксели) на холсте W x H
+async function frameBox(file) {
+  try {
+    const { err } = await run('ffmpeg', ['-hide_banner', '-loglevel', 'info', '-i', file,
+      '-vf', `scale=${W}:${H},format=rgba,alphaextract,bbox=min_val=128`,
+      '-frames:v', '1', '-f', 'null', '-']);
+    const m = err.match(/x1:(\d+)\s+x2:(\d+)\s+y1:(\d+)\s+y2:(\d+)/);
+    if (!m) return null;
+    const [x1, x2, y1, y2] = m.slice(1).map(Number);
+    const w = x2 - x1 + 1, h = y2 - y1 + 1;
+    if (w < 20 || h < 20 || (w >= W - 2 && h >= H - 2)) return null;
+    return { x: x1, y: y1, w: even(w), h: even(h) };
+  } catch (e) {
+    console.error('frameBox failed', e.message);
+    return null;
+  }
+}
+
 async function composite(layers, out) {
   const args = ['-f', 'lavfi', '-i', `color=c=black@0.0:s=${W}x${H},format=rgba`];
   layers.forEach(f => args.push('-i', f));
@@ -60,7 +77,6 @@ async function composite(layers, out) {
   await ff(args);
 }
 
-// Один рендер за раз, чтобы не удваивать память
 let queue = Promise.resolve();
 const serial = fn => { const r = queue.then(fn, fn); queue = r.catch(() => {}); return r; };
 
@@ -78,11 +94,34 @@ app.post('/render', upload.any(), async (req, res) => {
     let payload = {};
     try { payload = typeof req.body.payload === 'string' ? JSON.parse(req.body.payload) : (req.body.payload || {}); } catch (e) {}
 
+    let usedBox = null;
     const out = await serial(async () => {
       const p = n => path.join(dir, n);
       const D = (await probeDuration(f.vid.path)).toFixed(3);
-      const vidH = even((Number(payload.scale_to) || 750) * S);
-      const y = Math.round((Number(payload.y) || 0) * S);
+
+      // Позиция и размер vid: по рамке, иначе как раньше
+      const ramkaRef = f.ramka1 || f.ramka2 || f.ramka3;
+      const box = ramkaRef ? await frameBox(ramkaRef.path) : null;
+      usedBox = box;
+      const fit = String(payload.vid_fit || 'cover');
+      let vidVf, vidX, vidY;
+      if (box) {
+        if (fit === 'stretch') {
+          vidVf = `scale=${box.w}:${box.h}`;
+        } else if (fit === 'contain') {
+          vidVf = `scale=${box.w}:${box.h}:force_original_aspect_ratio=decrease,pad=${box.w}:${box.h}:(ow-iw)/2:(oh-ih)/2:color=black`;
+        } else {
+          vidVf = `scale=${box.w}:${box.h}:force_original_aspect_ratio=increase,crop=${box.w}:${box.h}`;
+        }
+        vidX = String(box.x);
+        vidY = String(box.y);
+      } else {
+        const vidH = even((Number(payload.scale_to) || 750) * S);
+        vidVf = `scale=-2:${vidH}`;
+        vidX = '(W-w)/2';
+        vidY = String(Math.round((Number(payload.y) || 0) * S));
+      }
+      console.log('vid box', box, 'fit', fit);
 
       // 1. Неподвижные слои
       const under = p('under.png');
@@ -103,7 +142,7 @@ app.post('/render', upload.any(), async (req, res) => {
         tops.push(t);
       }
 
-      // 2. Фон: зациклить, без звука, W x H
+      // 2. Фон
       const fonS = p('fon_s.mp4');
       const fonIsImage = /^image\//.test(f.fon.mimetype || '');
       await ff([
@@ -114,11 +153,11 @@ app.post('/render', upload.any(), async (req, res) => {
         '-pix_fmt', 'yuv420p', '-threads', '1', fonS,
       ]);
 
-      // 3. Vid: уменьшить, звук оставить
+      // 3. Vid под размер рамки
       const vidS = p('vid_s.mp4');
       await ff([
         '-threads', '1', '-i', f.vid.path,
-        '-vf', `scale=-2:${vidH},fps=${FPS}`,
+        '-vf', `${vidVf},fps=${FPS}`,
         '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '20', '-pix_fmt', 'yuv420p',
         '-c:a', 'aac', '-b:a', '128k', '-threads', '1', vidS,
       ]);
@@ -132,7 +171,7 @@ app.post('/render', upload.any(), async (req, res) => {
       ];
       tops.forEach(t => args.push('-loop', '1', '-framerate', String(FPS), '-t', D, '-i', t));
 
-      let fc = `[0:v][1:v]overlay=0:0[b1];[b1][2:v]overlay=(W-w)/2:${y}:eof_action=pass[b2]`;
+      let fc = `[0:v][1:v]overlay=0:0[b1];[b1][2:v]overlay=${vidX}:${vidY}:eof_action=pass[b2]`;
       let last = 'b2';
       const n = tops.length, cycle = n * 3;
       tops.forEach((t, i) => {
@@ -154,6 +193,7 @@ app.post('/render', upload.any(), async (req, res) => {
 
     res.setHeader('Content-Type', 'video/mp4');
     res.setHeader('Content-Disposition', 'attachment; filename="tiles_hop.mp4"');
+    if (usedBox) res.setHeader('X-Vid-Box', `${usedBox.x},${usedBox.y},${usedBox.w}x${usedBox.h}`);
     res.sendFile(out, err => { cleanup(); if (err && !res.headersSent) res.status(500).end(); });
   } catch (e) {
     cleanup();
