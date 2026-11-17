@@ -1,161 +1,212 @@
-// ─────────────────────────────────────────────────────────────────────────────
-// railway-github-ffmpeg
-//
-// Generic HTTP ffmpeg render service for the n8n "Scheduled and Manual Start"
-// block-based pipeline.
-//
-// NO Google authentication here. n8n lists the Drive folder itself and passes
-// PUBLIC download links; this service downloads each URL, runs a bash script,
-// and streams the produced output file straight back. n8n uploads it to Drive.
-//
-// Contract (node "Call Railway FFmpeg" for a block, and the assemble trigger):
-//   POST /render
-//   body: {
-//     topic_title?: string,                 // logging only
-//     files: [ { name, url }, ... ],        // downloaded into the work dir under `name`
-//     script?: string,                      // inline bash to write as run.sh and execute
-//     script_name?: string,                 // OR: name of a downloaded .sh file to run
-//     out?: string                          // output filename to stream back (default final.mp4)
-//   }
-//   -> response: the produced output file (Content-Type: video/mp4) as a binary body.
-//
-// If neither `script` nor `script_name` is given, it runs the newest downloaded *.sh.
-//
-// Auth (inbound, optional): set RENDER_TOKEN, send Authorization: Bearer <RENDER_TOKEN>.
-// ─────────────────────────────────────────────────────────────────────────────
-
-import express from 'express';
-import { spawn } from 'node:child_process';
-import { promises as fs, createReadStream, createWriteStream } from 'node:fs';
-import { pipeline } from 'node:stream/promises';
-import { Readable } from 'node:stream';
-import os from 'node:os';
-import path from 'node:path';
-
-const PORT = process.env.PORT || 8080;
-const RENDER_TOKEN = process.env.RENDER_TOKEN || '';
-
-// ── download a single public URL to a local path ─────────────────────────────
-async function downloadUrl(url, destPath) {
-  const resp = await fetch(url, { redirect: 'follow' });
-  if (!resp.ok || !resp.body) {
-    throw new Error(`download failed (${resp.status}) for ${url}`);
-  }
-  const ctype = resp.headers.get('content-type') || '';
-  if (ctype.includes('text/html')) {
-    const html = await resp.text();
-    const formAction = html.match(/action="(https:\/\/drive\.usercontent\.google\.com\/download[^"]*)"/);
-    if (formAction) {
-      const params = {};
-      const re = /name="([^"]+)"\s+value="([^"]*)"/g;
-      let mm;
-      while ((mm = re.exec(html)) !== null) params[mm[1]] = mm[2];
-      const usp = new URLSearchParams(params);
-      const retryUrl = formAction[1].replace(/&amp;/g, '&') + (formAction[1].includes('?') ? '&' : '?') + usp.toString();
-      const r2 = await fetch(retryUrl, { redirect: 'follow' });
-      if (!r2.ok || !r2.body) throw new Error(`download retry failed (${r2.status}) for ${url}`);
-      await pipeline(Readable.fromWeb(r2.body), createWriteStream(destPath));
-      return;
-    }
-    const m = html.match(/href="(\/uc\?export=download[^"]+)"/);
-    if (m) {
-      const retryUrl = 'https://drive.google.com' + m[1].replace(/&amp;/g, '&');
-      const r2 = await fetch(retryUrl, { redirect: 'follow' });
-      if (!r2.ok || !r2.body) throw new Error(`download retry failed (${r2.status}) for ${url}`);
-      await pipeline(Readable.fromWeb(r2.body), createWriteStream(destPath));
-      return;
-    }
-    throw new Error(`got HTML instead of file for ${url} (is it shared "anyone with link"?)`);
-  }
-  await pipeline(Readable.fromWeb(resp.body), createWriteStream(destPath));
-}
-
-// ── run a bash script ────────────────────────────────────────────────────────
-function runScript(scriptPath, cwd) {
-  return new Promise((resolve, reject) => {
-    const child = spawn('bash', [scriptPath], { cwd, env: process.env });
-    let stderr = '';
-    child.stdout.on('data', (d) => process.stdout.write(d));
-    child.stderr.on('data', (d) => {
-      stderr += d.toString();
-      process.stderr.write(d);
-    });
-    child.on('error', reject);
-    child.on('close', (code) => {
-      if (code === 0) resolve();
-      else reject(new Error('render script exited with code ' + code + '\n' + stderr.slice(-4000)));
-    });
-  });
-}
+const express = require('express');
+const multer = require('multer');
+const { spawn } = require('child_process');
+const fs = require('fs');
+const os = require('os');
+const path = require('path');
 
 const app = express();
-app.use(express.json({ limit: '10mb' }));
+const upload = multer({ dest: os.tmpdir() });
 
-function checkAuth(req, res) {
-  if (!RENDER_TOKEN) return true;
-  const hdr = req.get('authorization') || '';
-  if (hdr === `Bearer ${RENDER_TOKEN}`) return true;
-  res.status(401).json({ error: 'unauthorized' });
-  return false;
+const FONT = '/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf';
+
+const W = 900;
+const H = 1600;
+const FPS = 30;
+
+const GREEN = '0x1E7A1E';
+const DIGIT_COLOR = '0xD00000';
+const BORDER = 'white';
+
+const IMG = 300;
+const DIGIT_FONT = 110;
+const ANSWER_FONT = 90;
+
+const COL1_CX = 300;
+const COL2_CX = 600;
+const ROW1_CY = 451;
+const ROW2_CY = 751;
+const ANSWER_CY = 1000;
+
+const OVERLAY_NAMES = ['topleft', 'item', 'transport', 'nizpravo'];
+
+app.get('/health', (req, res) => res.json({ ok: true }));
+
+function esc(s) {
+  return String(s == null ? '' : s)
+    .replace(/\\/g, '\\\\')
+    .replace(/:/g, '\\:')
+    .replace(/'/g, '\u2019')
+    .replace(/%/g, '\\%')
+    .replace(/\r?\n/g, ' ');
 }
 
-app.get('/', (_req, res) => res.json({ ok: true, service: 'railway-github-ffmpeg' }));
-app.get('/health', (_req, res) => res.json({ ok: true }));
+function layoutRow(cut) {
+  const isPrefix = String(cut).toLowerCase() === 'prefix';
+  if (isPrefix) return { imgCX: COL1_CX, digitCX: COL2_CX };
+  return { imgCX: COL2_CX, digitCX: COL1_CX };
+}
 
-app.post('/render', async (req, res) => {
-  if (!checkAuth(req, res)) return;
+function digitDraw({ text, digitCX, rowCY, appear }) {
+  return [
+    'drawtext=fontfile=' + FONT,
+    "text='" + esc(text) + "'",
+    'fontsize=' + DIGIT_FONT,
+    'fontcolor=' + DIGIT_COLOR,
+    'borderw=4',
+    'bordercolor=' + BORDER,
+    'x=(' + digitCX + '-text_w/2)',
+    'y=(' + rowCY + '-text_h/2)',
+    "enable='gte(t," + appear + ")'",
+  ].join(':');
+}
 
-  const { topic_title, files, script, script_name, out } = req.body || {};
-  if (!Array.isArray(files) || files.length === 0) {
-    return res.status(400).json({ error: 'files[] is required (array of { name, url })' });
-  }
-  const outName = (out && /^[\w.\-]+$/.test(out)) ? out : 'final.mp4';
+function answerDraw({ text, cy, appear }) {
+  return [
+    'drawtext=fontfile=' + FONT,
+    "text='" + esc(text) + "'",
+    'fontsize=' + ANSWER_FONT,
+    'fontcolor=' + GREEN,
+    'borderw=4',
+    'bordercolor=' + BORDER,
+    'x=(w-text_w)/2',
+    'y=(' + cy + '-text_h/2)',
+    "enable='gte(t," + appear + ")'",
+  ].join(':');
+}
 
-  const work = await fs.mkdtemp(path.join(os.tmpdir(), 'render-'));
-  console.log(`[render] topic="${topic_title || ''}" files=${files.length} out=${outName} work=${work}`);
+app.post(
+  '/render',
+  upload.fields([
+    { name: 'fon', maxCount: 1 },
+    { name: 'img1', maxCount: 1 },
+    { name: 'img2', maxCount: 1 },
+    { name: 'topleft', maxCount: 1 },
+    { name: 'item', maxCount: 1 },
+    { name: 'transport', maxCount: 1 },
+    { name: 'nizpravo', maxCount: 1 },
+  ]),
+  (req, res) => {
+    let payload = {};
+    try { payload = JSON.parse(req.body.payload || '{}'); }
+    catch (e) { return res.status(400).json({ error: 'BAD_PAYLOAD', detail: String(e) }); }
 
-  try {
-    for (const f of files) {
-      if (!f || !f.name || !f.url) continue;
-      await downloadUrl(f.url, path.join(work, f.name));
-      console.log(`[render] downloaded ${f.name}`);
+    const f = req.files || {};
+    for (const k of ['fon', 'img1', 'img2']) {
+      if (!f[k] || !f[k][0]) return res.status(400).json({ error: 'MISSING_FILE', field: k });
     }
 
-    let scriptToRun;
-    if (typeof script === 'string' && script.trim()) {
-      scriptToRun = 'run.sh';
-      await fs.writeFile(path.join(work, scriptToRun), script, 'utf8');
-    } else if (script_name) {
-      scriptToRun = script_name;
+    const t = payload.timings || {};
+    const start = Number(t.start != null ? t.start : 2);
+    const step = Number(t.step != null ? t.step : 0.3);
+    const answerReveal = Number(t.answer_reveal != null ? t.answer_reveal : 13.2);
+    const duration = Number(t.duration != null ? t.duration : (payload.duration || 15));
+
+    const answer = payload.answer || '';
+    const digit1 = payload.digit1 != null ? String(payload.digit1) : '';
+    const digit2 = payload.digit2 != null ? String(payload.digit2) : '';
+    const cut1 = payload.cut1 || 'prefix';
+    const cut2 = payload.cut2 || 'suffix';
+
+    const r1 = layoutRow(cut1);
+    const r2 = layoutRow(cut2);
+
+    const tImg1 = start;
+    const tDig1 = start + step;
+    const tImg2 = start + 2 * step;
+    const tDig2 = start + 3 * step;
+
+    const outPath = path.join(os.tmpdir(), 'out_' + Date.now() + '.mp4');
+
+    const args = ['-y'];
+    args.push('-stream_loop', '-1', '-i', f.fon[0].path);
+    args.push('-loop', '1', '-i', f.img1[0].path);
+    args.push('-loop', '1', '-i', f.img2[0].path);
+    let idx = 3;
+    const overlayInputs = [];
+    for (const nm of OVERLAY_NAMES) {
+      if (f[nm] && f[nm][0]) { args.push('-loop', '1', '-i', f[nm][0].path); overlayInputs.push({ nm, idx }); idx++; }
+    }
+
+    const segs = [];
+    segs.push('[0:v]scale=' + W + ':' + H + ',setsar=1,fps=' + FPS + '[bg]');
+    let last = 'bg';
+
+    overlayInputs.forEach((ov, i) => {
+      const sc = 'fr' + i;
+      segs.push('[' + ov.idx + ':v]scale=' + W + ':' + H + '[' + sc + ']');
+      const out = 'ov' + i;
+      segs.push('[' + last + '][' + sc + ']overlay=0:0[' + out + ']');
+      last = out;
+    });
+
+    segs.push('[1:v]scale=' + IMG + ':' + IMG + '[p1]');
+    segs.push('[2:v]scale=' + IMG + ':' + IMG + '[p2]');
+    segs.push('[' + last + '][p1]overlay=x=' + (r1.imgCX - IMG / 2) + ':y=' + (ROW1_CY - IMG / 2) +
+              ":enable='gte(t," + tImg1 + ")'[o1]");
+    segs.push('[o1][p2]overlay=x=' + (r2.imgCX - IMG / 2) + ':y=' + (ROW2_CY - IMG / 2) +
+              ":enable='gte(t," + tImg2 + ")'[o2]");
+    last = 'o2';
+
+    const draws = [];
+    if (digit1) draws.push(digitDraw({ text: digit1, digitCX: r1.digitCX, rowCY: ROW1_CY, appear: tDig1 }));
+    if (digit2) draws.push(digitDraw({ text: digit2, digitCX: r2.digitCX, rowCY: ROW2_CY, appear: tDig2 }));
+    if (answer) draws.push(answerDraw({ text: answer, cy: ANSWER_CY, appear: answerReveal }));
+
+    let prev = last;
+    draws.forEach((d, i2) => {
+      const out = 'd' + i2;
+      segs.push('[' + prev + ']' + d + '[' + out + ']');
+      prev = out;
+    });
+    if (draws.length === 0) {
+      segs.push('[' + last + ']null[vout]');
     } else {
-      const local = await fs.readdir(work);
-      const shFiles = local.filter((n) => /\.sh$/i.test(n)).sort();
-      scriptToRun = shFiles[shFiles.length - 1];
-    }
-    if (!scriptToRun) {
-      return res.status(422).json({ error: 'no script to run (provide script, script_name, or a .sh file)' });
-    }
-    console.log(`[render] running ${scriptToRun}`);
-    await runScript(path.join(work, scriptToRun), work);
-
-    const finalPath = path.join(work, outName);
-    try {
-      await fs.access(finalPath);
-    } catch {
-      return res.status(500).json({ error: `render finished but ${outName} was not produced` });
+      segs[segs.length - 1] = segs[segs.length - 1].replace('[' + prev + ']', '[vout]');
     }
 
-    res.setHeader('Content-Type', 'video/mp4');
-    res.setHeader('Content-Disposition', `attachment; filename="${outName}"`);
-    console.log(`[render] done -> streaming ${outName}`);
-    await pipeline(createReadStream(finalPath), res);
-  } catch (err) {
-    console.error('[render] error:', err);
-    if (!res.headersSent) res.status(500).json({ error: err.message });
-    else res.end();
-  } finally {
-    fs.rm(work, { recursive: true, force: true }).catch(() => {});
+    const filterComplex = segs.join(';');
+
+    args.push(
+      '-filter_complex', filterComplex,
+      '-map', '[vout]',
+      '-map', '0:a?',
+      '-t', String(duration),
+      '-r', String(FPS),
+      '-pix_fmt', 'yuv420p',
+      '-c:v', 'libx264',
+      '-preset', 'ultrafast',
+      '-threads', '2',
+      '-filter_complex_threads', '1',
+      '-c:a', 'aac',
+      '-b:a', '192k',
+      '-shortest',
+      '-movflags', '+faststart',
+      outPath
+    );
+
+    const ff = spawn('ffmpeg', args);
+    let stderr = '';
+    ff.stderr.on('data', (d) => { stderr += d.toString(); });
+
+    ff.on('close', (code) => {
+      if (code !== 0 || !fs.existsSync(outPath)) {
+        console.error('FFMPEG FAILED code=' + code);
+        console.error(stderr);
+        return res.status(500).json({ error: 'FFMPEG_FAILED', exitCode: code, stderr: stderr.slice(-4000) });
+      }
+      res.setHeader('Content-Type', 'video/mp4');
+      const stream = fs.createReadStream(outPath);
+      stream.pipe(res);
+      stream.on('close', () => { try { fs.unlinkSync(outPath); } catch (e) {} });
+    });
+
+    ff.on('error', (err) => {
+      console.error('SPAWN ERROR', err);
+      res.status(500).json({ error: 'SPAWN_ERROR', detail: String(err) });
+    });
   }
-});
+);
 
-app.listen(PORT, () => console.log(`railway-github-ffmpeg listening on :${PORT}`));
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => console.log('Render server on ' + PORT));
